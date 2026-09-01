@@ -1,0 +1,11 @@
+# Segredos — nunca commitar
+.env
+
+# Cache local de partidas (dados baixados da Riot API, regenerável)
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
