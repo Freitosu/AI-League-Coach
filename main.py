@@ -22,6 +22,7 @@ def coletar_partidas(game_name: str, tag_line: str, count: int):
     print(f"Resolvendo PUUID de {game_name}#{tag_line}...")
     puuid = client.get_puuid(game_name, tag_line)
     print(f"PUUID: {puuid}")
+    storage.save_player(puuid, game_name, tag_line)
 
     print(f"Buscando as {count} partidas mais recentes...")
     match_ids = client.get_match_ids(puuid, count=count)
@@ -41,6 +42,7 @@ def coletar_partidas(game_name: str, tag_line: str, count: int):
     print("\nConcluído. Partidas armazenadas localmente:")
     for m in storage.list_stored_matches(puuid):
         print(f"  {m['match_id']}  duração={m['game_duration']}s  queue={m['queue_id']}")
+    print("\nPara escolher uma partida e ver o relatório de macro, rode:\n  python select_match.py")
 
 
 if __name__ == "__main__":

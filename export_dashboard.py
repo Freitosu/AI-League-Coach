@@ -389,6 +389,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", "-o", default="dashboard.html", help="Arquivo HTML de saída")
     args = parser.parse_args()
 
+    storage.init_db()
     puuid = escolher_jogador(args.puuid)
     print("Buscando versão atual do Data Dragon (ícones dos campeões)...")
     version = get_latest_ddragon_version()
