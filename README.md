@@ -33,6 +33,13 @@ visão computacional sobre o vídeo.
 python main.py "SeuNome" "TAG" --count 10
 ```
 
+Depois, para escolher qual partida analisar (mostra campeão, data/hora
+e vitória/derrota):
+
+```bash
+python select_match.py
+```
+
 Isso vai:
 1. Resolver seu Riot ID para PUUID
 2. Buscar as N partidas mais recentes
@@ -44,13 +51,16 @@ Isso vai:
 ## Estrutura
 
 ```
-config.py         # configuração (API key, região, rate limits)
+config.py         # configuração (API key, região, rate limits, Ollama)
 rate_limiter.py    # respeita os limites da Riot API automaticamente
 riot_client.py     # chamadas HTTP: account, match ids, match, timeline
-storage.py         # cache local em SQLite
-main.py            # script de exemplo (coleta ponta a ponta)
+storage.py         # cache local em SQLite (partidas, jogadores)
+main.py            # coleta ponta a ponta (Riot API -> SQLite)
+select_match.py    # escolhe interativamente qual partida analisar
 heuristics.py      # heurísticas de macro: CS, wards, roams, objetivos, etc.
-analyze.py         # roda as heurísticas sobre uma partida do cache
+analyze.py         # roda as heurísticas (+ comentário opcional) sobre uma partida
+ollama_client.py   # cliente mínimo para o Ollama local
+commentary.py      # gera o comentário de coach a partir dos eventos
 test_heuristics.py # teste sintético das heurísticas
 ```
 
@@ -71,19 +81,65 @@ Rodar o teste sintético (não depende da API):
 python test_heuristics.py
 ```
 
-**Heurísticas ainda não implementadas** (da lista completa discutida):
-freeze/push de wave, CS perdido em recall, resposta a gank, gold parado
-(unspent gold) — todas dependem de sinais que a Timeline API não expõe
-diretamente (wave state, eventos de recall) e exigiriam aproximações
-mais elaboradas por posição/tempo. Posso completá-las se forem
-prioridade, ou seguimos para a Parte 3 (comentário via LLM local) com
-o que já está pronto.
+Todas as 13 heurísticas da lista original estão implementadas,
+incluindo as 4 aproximadas (freeze/push de wave, CS perdido em recall,
+resposta a gank, gold parado) que dependem de proxies de posição em
+vez de eventos diretos da API — o `detalhe` de cada evento deixa claro
+quando é uma aproximação.
+
+## Parte 3 — Comentário via LLM local (implementada)
+
+Usa o [Ollama](https://ollama.com) rodando na sua máquina — sem custo
+de tokens, sem depender de internet após o download do modelo.
+
+1. Instale o Ollama e baixe um modelo:
+   ```bash
+   ollama pull llama3.1:8b
+   ```
+2. Deixe o Ollama rodando (abre em segundo plano após instalado, ou
+   rode `ollama serve` manualmente).
+3. Rode a análise com a flag `--commentary`:
+   ```bash
+   python select_match.py --commentary
+   # ou
+   python analyze.py <match_id> <puuid> --commentary
+   ```
+
+O `commentary.py` recebe os eventos estruturados (não o vídeo, nem
+dados brutos) e escreve um comentário organizado por fase do jogo
+(early/mid/late) com recomendações — o modelo local só precisa
+"traduzir" dado estruturado em texto, não entender LoL do zero.
+
+Se o Ollama não estiver rodando ou o modelo não estiver baixado, o
+script avisa exatamente o que fazer em vez de travar.
+
+## Dashboard visual (estilo BI)
+
+`export_dashboard.py` gera um arquivo HTML único e autônomo com um
+painel visual de todas as partidas em cache: KPIs (win rate, alertas
+críticos, campeão mais jogado), lista de partidas com ícone do campeão
+ao lado do nome, e por partida uma linha do tempo dos eventos de macro
+coloridos por severidade, gráfico de fase do jogo e a lista detalhada.
+
+```bash
+python export_dashboard.py
+```
+
+Depois é só abrir o `dashboard.html` gerado no navegador (duplo
+clique) — não precisa de servidor. Os ícones dos campeões vêm do Data
+Dragon oficial da Riot; se estiver offline na hora de abrir, caem num
+ícone genérico de fallback e o resto do dashboard continua funcionando
+normalmente.
 
 ## Próximos passos
 
-- **Parte 3 — Geração de comentário via LLM local**: usar Ollama
-  (`OLLAMA_HOST`/`OLLAMA_MODEL` já em `config.py`) para transformar os
-  eventos estruturados em comentário de coach, sem custo de API.
 - **Sincronização com vídeo**: input manual (ou detecção simples) do
   timestamp de início da partida no vídeo para converter
-  minuto_de_jogo → timestamp_do_vídeo.
+  minuto_de_jogo → timestamp_do_vídeo, e permitir pular direto para o
+  momento do erro/acerto ao assistir a gravação.
+- **Ajuste fino de benchmarks**: os valores de CS/min e de spawn de
+  objetivo em `heuristics.py` são aproximados; ajustar por elo/patch
+  deixaria os alertas mais precisos.
+- **Experimentar modelos maiores no Ollama** (ex: `qwen2.5:14b`) se a
+  qualidade do comentário do `llama3.1:8b` não for suficiente — troque
+  só `OLLAMA_MODEL` em `config.py` ou no `.env`.

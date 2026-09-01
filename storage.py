@@ -93,6 +93,28 @@ def load_match(match_id: str):
         conn.close()
 
 
+def get_match_summary(match_id: str):
+    """Retorna champion_name/win/game_duration etc. de uma partida em cache, sem carregar o JSON inteiro."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT match_id, game_creation, game_duration, queue_id, champion_name, win FROM matches WHERE match_id = ?",
+            (match_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "match_id": row[0],
+            "game_creation": row[1],
+            "game_duration": row[2],
+            "queue_id": row[3],
+            "champion_name": row[4],
+            "win": bool(row[5]) if row[5] is not None else None,
+        }
+    finally:
+        conn.close()
+
+
 def list_stored_matches(puuid: str):
     conn = get_connection()
     try:
