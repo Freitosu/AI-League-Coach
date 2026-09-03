@@ -4,8 +4,20 @@
 # Cache local de partidas (dados baixados da Riot API, regenerável)
 data/
 
+# Dashboard gerado (regenerável via export_dashboard.py / refresh.py, contém dados embutidos)
+dashboard.html
+
 # Python
 __pycache__/
 *.pyc
 .venv/
 venv/
+
+# SO / editor
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs (se algum script vier a gerar)
+*.log
