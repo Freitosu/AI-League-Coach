@@ -59,4 +59,5 @@ if __name__ == "__main__":
     parser.add_argument("--commentary", "-c", action="store_true", help="Gera comentário de coach via LLM local (Ollama)")
     args = parser.parse_args()
 
+    storage.init_db()
     analisar(args.match_id, args.puuid, args.output, args.commentary)

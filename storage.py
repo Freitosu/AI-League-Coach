@@ -13,6 +13,8 @@ import sqlite3
 import config
 
 
+CACHE_MAX_AGE_DAYS = 2  # partidas com mais de N dias no cache são excluídas automaticamente
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS matches (
     match_id TEXT PRIMARY KEY,
@@ -22,6 +24,7 @@ CREATE TABLE IF NOT EXISTS matches (
     queue_id INTEGER,
     champion_name TEXT,
     win INTEGER,
+    coach_commentary TEXT,
     raw_match_json TEXT NOT NULL,
     raw_timeline_json TEXT,
     fetched_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -51,6 +54,8 @@ def _migrate(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE matches ADD COLUMN champion_name TEXT")
     if "win" not in existing_cols:
         conn.execute("ALTER TABLE matches ADD COLUMN win INTEGER")
+    if "coach_commentary" not in existing_cols:
+        conn.execute("ALTER TABLE matches ADD COLUMN coach_commentary TEXT")
     conn.commit()
 
 
@@ -110,6 +115,22 @@ def _extract_summary(match_data: dict, puuid: str):
     return None, None
 
 
+def cleanup_expired_matches(max_age_days: int = CACHE_MAX_AGE_DAYS) -> int:
+    """Remove do cache local partidas baixadas há mais de max_age_days.
+    Não afeta a tabela players (a identidade do jogador é mantida).
+    Retorna quantas partidas foram removidas."""
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM matches WHERE julianday('now') - julianday(fetched_at) > ?",
+            (max_age_days,),
+        )
+        conn.commit()
+        return cursor.rowcount
+    finally:
+        conn.close()
+
+
 def init_db():
     conn = get_connection()
     try:
@@ -120,6 +141,10 @@ def init_db():
         _backfill_players(conn)
     finally:
         conn.close()
+
+    removidas = cleanup_expired_matches()
+    if removidas:
+        print(f"[Cache] {removidas} partida(s) com mais de {CACHE_MAX_AGE_DAYS} dias foram removidas do cache local.")
 
 
 def save_player(puuid: str, game_name: str, tag_line: str):
@@ -216,6 +241,25 @@ def get_match_summary(match_id: str):
             "champion_name": row[4],
             "win": bool(row[5]) if row[5] is not None else None,
         }
+    finally:
+        conn.close()
+
+
+def get_commentary(match_id: str):
+    """Retorna o comentário de coach já gerado e cacheado para essa partida, ou None."""
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT coach_commentary FROM matches WHERE match_id = ?", (match_id,)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def save_commentary(match_id: str, text: str):
+    conn = get_connection()
+    try:
+        conn.execute("UPDATE matches SET coach_commentary = ? WHERE match_id = ?", (text, match_id))
+        conn.commit()
     finally:
         conn.close()
 

@@ -61,6 +61,8 @@ heuristics.py      # heurísticas de macro: CS, wards, roams, objetivos, etc.
 analyze.py         # roda as heurísticas (+ comentário opcional) sobre uma partida
 ollama_client.py   # cliente mínimo para o Ollama local
 commentary.py      # gera o comentário de coach a partir dos eventos
+export_dashboard.py # gera o dashboard.html (com ícones, comentário, etc.)
+refresh.py         # busca partidas novas na Riot API + regenera o dashboard
 test_heuristics.py # teste sintético das heurísticas
 ```
 
@@ -119,10 +121,12 @@ script avisa exatamente o que fazer em vez de travar.
 painel visual de todas as partidas em cache: KPIs (win rate, alertas
 críticos, campeão mais jogado), lista de partidas com ícone do campeão
 ao lado do nome, e por partida uma linha do tempo dos eventos de macro
-coloridos por severidade, gráfico de fase do jogo e a lista detalhada.
+coloridos por severidade, gráfico de fase do jogo, comentário do coach
+e a lista detalhada.
 
 ```bash
-python export_dashboard.py
+python export_dashboard.py                # só heurísticas
+python export_dashboard.py --commentary   # + comentário via Ollama (cacheado por partida)
 ```
 
 Depois é só abrir o `dashboard.html` gerado no navegador (duplo
@@ -130,6 +134,37 @@ clique) — não precisa de servidor. Os ícones dos campeões vêm do Data
 Dragon oficial da Riot; se estiver offline na hora de abrir, caem num
 ícone genérico de fallback e o resto do dashboard continua funcionando
 normalmente.
+
+O comentário do coach (`--commentary`) fica **cacheado no banco** por
+partida — só é gerado de novo se a partida sair e voltar pro cache
+(após expirar e ser rebaixada). Cada chamada ao Ollama roda localmente
+e pode levar alguns segundos por partida, dependendo do modelo e da
+sua máquina.
+
+## Expiração de cache e atualização de partidas
+
+Partidas ficam em cache local por **2 dias** (contados a partir de
+quando foram baixadas, não da data do jogo). Toda vez que qualquer
+script roda `storage.init_db()` (o que main.py, select_match.py,
+analyze.py e export_dashboard.py já fazem), partidas mais antigas que
+isso são removidas automaticamente do banco — isso mantém o cache
+enxuto e os dados sempre razoavelmente recentes. Ajustável via
+`storage.CACHE_MAX_AGE_DAYS`.
+
+Como o dashboard é um HTML estático (não pode chamar a Riot API
+sozinho sem expor sua key no navegador), atualizar com partidas novas
+é feito por um script único que busca o que tem de novo e já regenera
+o dashboard:
+
+```bash
+python refresh.py                  # verifica as 10 partidas mais recentes
+python refresh.py --count 20
+python refresh.py --commentary     # também gera comentário nas partidas novas
+```
+
+Depois é só dar F5 (ou reabrir) o `dashboard.html` no navegador. O
+próprio dashboard mostra no rodapé da barra lateral quando foi gerado
+pela última vez e o comando pra atualizar.
 
 ## Próximos passos
 

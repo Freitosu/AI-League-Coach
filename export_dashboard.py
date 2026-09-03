@@ -23,6 +23,8 @@ import requests
 
 import storage
 from heuristics import run_all_heuristics
+from commentary import gerar_comentario
+from ollama_client import OllamaError
 
 
 DDRAGON_VERSIONS_URL = "https://ddragon.leagueoflegends.com/api/versions.json"
@@ -54,7 +56,7 @@ def escolher_jogador(puuid_arg: str = None) -> str:
     return players[0]["puuid"]
 
 
-def montar_dados(puuid: str, ddragon_version: str) -> dict:
+def montar_dados(puuid: str, ddragon_version: str, gerar_comentarios: bool = False) -> dict:
     players = {p["puuid"]: p for p in storage.list_players()}
     player_info = players.get(puuid, {"game_name": "Jogador", "tag_line": ""})
 
@@ -75,6 +77,20 @@ def montar_dados(puuid: str, ddragon_version: str) -> dict:
             counts[e.get("severidade", "info")] = counts.get(e.get("severidade", "info"), 0) + 1
 
         champion = m["champion_name"] or "Desconhecido"
+
+        coach_commentary = storage.get_commentary(m["match_id"])
+        if coach_commentary is None and gerar_comentarios:
+            print(f"  Gerando comentário do coach para {champion} ({m['match_id']})...")
+            try:
+                coach_commentary = gerar_comentario(
+                    {"champion_name": champion, "win": m["win"], "game_duration": m["game_duration"]},
+                    events,
+                )
+                storage.save_commentary(m["match_id"], coach_commentary)
+            except OllamaError as e:
+                print(f"  [Aviso] Não foi possível gerar comentário via Ollama: {e}", file=sys.stderr)
+                coach_commentary = None
+
         matches_out.append({
             "match_id": m["match_id"],
             "champion_name": champion,
@@ -84,6 +100,7 @@ def montar_dados(puuid: str, ddragon_version: str) -> dict:
             "game_duration_s": m["game_duration"],
             "events": events,
             "counts": counts,
+            "coach_commentary": coach_commentary,
         })
 
     return {
@@ -149,6 +166,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .chip-row{margin-top:8px;}
   .chip{background:var(--panel-2);border:1px solid var(--border);border-radius:5px;padding:3px 9px;font-size:12px;color:var(--text-dim);margin-right:8px;display:inline-block;}
 
+  .commentary-box{background:var(--panel-2);border:1px solid var(--border);border-left:3px solid var(--gold);border-radius:8px;padding:18px 20px;margin-bottom:28px;}
+  .commentary-box h3{font-size:12.5px;color:var(--text-dim);margin-bottom:10px;font-weight:600;}
+  .commentary-text{font-size:13.5px;line-height:1.65;color:var(--text);white-space:pre-wrap;}
+  .commentary-text.muted{color:var(--text-dim);font-style:italic;}
+  .commentary-text.muted code{background:var(--panel);padding:1px 5px;border-radius:3px;color:var(--teal);font-style:normal;}
+
   .timeline-wrap{margin-bottom:28px;}
   .timeline-label{font-size:12px;color:var(--text-dim);margin-bottom:8px;}
   .timeline{position:relative;height:56px;background:var(--panel-2);border-radius:6px;border:1px solid var(--border);}
@@ -183,6 +206,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .kpi-row{grid-template-columns:repeat(2,1fr);}
     .panels-row{grid-template-columns:1fr;}
   }
+
+  .sidebar-footer{padding:12px 16px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim);line-height:1.6;}
+  .sidebar-footer code{background:var(--panel);padding:1px 5px;border-radius:3px;color:var(--teal);}
 </style>
 </head>
 <body>
@@ -194,6 +220,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
     <input type="text" id="filterInput" class="filter-input" placeholder="Filtrar por campeão">
     <div class="match-list" id="matchList"></div>
+    <div class="sidebar-footer">
+      Atualizado em <span id="generatedAt"></span><br>
+      Partidas somem do cache após 2 dias.<br>
+      Para ver partidas novas: <code>python refresh.py</code>
+    </div>
   </aside>
   <main class="main">
     <section class="kpi-row" id="kpiRow"></section>
@@ -352,6 +383,12 @@ function renderDetail(m){
         '</div>' +
       '</div>' +
     '</div>' +
+    '<div class="commentary-box">' +
+      '<h3>Comentário do coach</h3>' +
+      (m.coach_commentary
+        ? '<div class="commentary-text">' + m.coach_commentary + '</div>'
+        : '<div class="commentary-text muted">Ainda não gerado para esta partida. Rode <code>python export_dashboard.py --commentary</code> (usa o Ollama local).</div>') +
+    '</div>' +
     '<div class="timeline-wrap">' +
       '<div class="timeline-label">Linha do tempo de macro (posição = minuto da partida)</div>' +
       '<div class="timeline">' + dots + '</div>' +
@@ -367,6 +404,7 @@ function renderDetail(m){
 }
 
 document.getElementById('playerTag').textContent = DATA.player.game_name + '#' + DATA.player.tag_line;
+document.getElementById('generatedAt').textContent = new Date(DATA.generated_at).toLocaleString('pt-BR');
 document.getElementById('filterInput').addEventListener('input', function(e){ renderSidebar(e.target.value); });
 
 renderKPIs();
@@ -387,6 +425,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Gera um dashboard HTML das partidas analisadas")
     parser.add_argument("--puuid", help="PUUID do jogador (opcional se só houver um salvo)")
     parser.add_argument("--output", "-o", default="dashboard.html", help="Arquivo HTML de saída")
+    parser.add_argument("--commentary", "-c", action="store_true", help="Gera (e cacheia) comentário de coach via Ollama para cada partida")
     args = parser.parse_args()
 
     storage.init_db()
@@ -396,7 +435,7 @@ if __name__ == "__main__":
     print(f"Versão: {version}")
 
     print("Rodando heurísticas em todas as partidas do cache...")
-    dados = montar_dados(puuid, version)
+    dados = montar_dados(puuid, version, gerar_comentarios=args.commentary)
     print(f"{len(dados['matches'])} partidas processadas.")
 
     html = gerar_html(dados)
