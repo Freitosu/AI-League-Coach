@@ -6,7 +6,8 @@ Lê o (match, timeline) já salvos pela Parte 1 e produz uma lista de
 na Parte 3 (LLM local). Cada heurística retorna uma lista de dicts no
 formato:
 
-    {"tipo": str, "minuto": float, "detalhe": str, "severidade": "info"|"atencao"|"critico"}
+    {"tipo": str, "minuto": float, "detalhe": str, "severidade": "positivo"|"info"|"atencao"|"critico",
+     "confianca": "alta"|"media"|"baixa"}
 
 Notas de honestidade sobre os dados:
 - A Riot Timeline API não expõe "wave state" nem "recall" como eventos
@@ -15,9 +16,18 @@ Notas de honestidade sobre os dados:
   compras de item, e está marcado como tal no docstring da função.
 - Os benchmarks de CS/min e de spawn de objetivo são valores
   aproximados e podem precisar de ajuste por patch/elo.
+- Checkpoints de tempo (5/10/15/20min) só são avaliados se a partida
+  durou o suficiente para chegar lá — evita comparar dado de partida
+  curta (ou remake) com um benchmark de um minuto que nunca aconteceu.
+- Partidas encerradas como "remake" (abandono/AFK nos primeiros
+  minutos, campo gameEndedInEarlySurrender da Riot) não têm heurísticas
+  de macro rodadas — não há dado relevante pra analisar.
+- "Motivo provável de rendição" é uma inferência qualitativa a partir
+  do estado do jogo pouco antes do fim (gold, torres), não uma causa
+  confirmada — a Riot não expõe o motivo real da votação de FF.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -35,10 +45,29 @@ TEAMFIGHT_WINDOW_S = 12        # kills dentro dessa janela contam como o mesmo t
 ISOLATED_DEATH_MAX_ALLY_DIST = 3000  # distância do aliado mais próximo para considerar morte "isolada"
 
 # Posição aproximada da fonte de cada time no Summoner's Rift (usada como proxy de "está na base").
-# Coordenadas aproximadas — não há campo direto de "em base" na Timeline API.
 BASE_COORDS = {100: {"x": 1500, "y": 1500}, 200: {"x": 13500, "y": 13500}}
 NEAR_BASE_RADIUS = 2200
 UNSPENT_GOLD_THRESHOLD = 1500   # gold parado considerado relevante
+
+GOOD_TRADE_MIN_DAMAGE = 800        # dano mínimo pra considerar a janela relevante
+GOOD_TRADE_RATIO = 1.5             # dano causado deve ser >= 1.5x o dano recebido
+SURRENDER_GOLD_THRESHOLD = 3000    # desvantagem de gold considerada "motivo provável" de FF
+SURRENDER_TOWER_DIFF = 3           # diferença de torres perdidas/tomadas considerada "motivo provável"
+
+# Nomes de monstros em PT-BR — a Riot retorna o monsterType cru (ex: "HORDE", "RIFTHERALD"),
+# que não deve vazar pro comentário do coach sem tradução.
+MONSTER_NAME_PT = {
+    "DRAGON": "Dragão",
+    "RIFTHERALD": "Arauto do Rift",
+    "BARON_NASHOR": "Barão Nashor",
+    "HORDE": "Enxame de Void Grubs",
+    "ATAKHAN": "Atakhan",
+}
+
+
+def monster_name_pt(monster_type: str) -> str:
+    """Traduz o monsterType cru da Riot para um nome legível em PT-BR."""
+    return MONSTER_NAME_PT.get(monster_type, (monster_type or "objetivo").replace("_", " ").title())
 
 
 @dataclass
@@ -47,9 +76,19 @@ class MacroEvent:
     minuto: float
     detalhe: str
     severidade: str = "info"
+    # "alta" = fato observado direto na timeline (ex: torre destruída, gold real).
+    # "media" = inferência razoável a partir de dados reais, mas não certeza (ex: posição, distância, janela de tempo).
+    # "baixa" = heurística aproximada que o próprio sistema já marca como incerta (os "possivel_*").
+    confianca: str = "alta"
 
     def to_dict(self):
-        return {"tipo": self.tipo, "minuto": round(self.minuto, 1), "detalhe": self.detalhe, "severidade": self.severidade}
+        return {
+            "tipo": self.tipo,
+            "minuto": round(self.minuto, 1),
+            "detalhe": self.detalhe,
+            "severidade": self.severidade,
+            "confianca": self.confianca,
+        }
 
 
 # --- Helpers de acesso aos dados ---
@@ -100,22 +139,97 @@ def distance(pos_a: dict, pos_b: dict) -> float:
 
 def frame_at_minute(frames: list, minute: float) -> Optional[dict]:
     """Frame mais próximo de um minuto de jogo (frames vêm a cada ~1min)."""
-    target_ms = minute * 60000
-    return min(frames, key=lambda f: abs(f["timestamp"] - target_ms), default=None)
+    if not frames:
+        return None
+    return min(frames, key=lambda f: abs(f["timestamp"] - minute * 60000))
 
 
 def team_participant_ids(match: dict, team_id: int) -> list:
     return [p["participantId"] for p in match["info"]["participants"] if p["teamId"] == team_id]
 
 
+def reachable_checkpoints(checkpoints, game_duration_s: int) -> list:
+    """Filtra checkpoints de minuto (ex: 5/10/15/20) para os que a partida
+    realmente alcançou — evita comparar CS de uma partida curta contra o
+    benchmark de um minuto que nunca aconteceu (bug: 'CS aos 5min' usando
+    o frame mais próximo disponível, que podia ser o de 1min numa partida curta)."""
+    return [c for c in checkpoints if c * 60 <= (game_duration_s or 0)]
+
+
+# --- Fim de jogo: remake e rendição ---
+
+def is_remake(match: dict, puuid: str) -> bool:
+    """True se a partida terminou como remake (abandono/AFK nos primeiros minutos)."""
+    try:
+        participant = get_analyzed_participant(match, puuid)
+    except ValueError:
+        return False
+    return bool(participant.get("gameEndedInEarlySurrender"))
+
+
+def h_rendicao(match: dict, timeline: dict, participant: dict, opponent) -> list:
+    """
+    Detecta se a partida terminou por rendição (surrender) e tenta indicar
+    um motivo provável com base no estado do jogo pouco antes do fim —
+    diferença de gold do time e saldo de torres. É uma inferência
+    qualitativa, não uma causa confirmada (a Riot não expõe o motivo real
+    da votação de FF).
+    """
+    out = []
+    if not participant.get("gameEndedInSurrender"):
+        return out
+
+    team_id = participant["teamId"]
+    team_ids = team_participant_ids(match, team_id)
+    enemy_ids = [p["participantId"] for p in match["info"]["participants"] if p["teamId"] != team_id]
+    frames = get_frames(timeline)
+    if not frames:
+        return out
+
+    last_frame = frames[-1]
+    minute = frame_minute(last_frame)
+    team_gold = sum(pframe(last_frame, i).get("totalGold", 0) for i in team_ids if pframe(last_frame, i))
+    enemy_gold = sum(pframe(last_frame, i).get("totalGold", 0) for i in enemy_ids if pframe(last_frame, i))
+    gold_diff = team_gold - enemy_gold
+
+    towers_lost = sum(1 for e in all_events(timeline) if e.get("type") == "BUILDING_KILL" and e.get("teamId") == team_id)
+    towers_taken = sum(1 for e in all_events(timeline) if e.get("type") == "BUILDING_KILL" and e.get("teamId") != team_id)
+
+    won = bool(participant.get("win"))
+
+    if won:
+        detalhe = f"Partida encerrada por rendição do time adversário, aos {minute:.0f}min — sua equipe estava à frente."
+        out.append(MacroEvent("rendicao", minute, detalhe, "positivo", confianca="media"))
+        return [e.to_dict() for e in out]
+
+    if gold_diff <= -SURRENDER_GOLD_THRESHOLD:
+        motivo = f"grande desvantagem de gold ({abs(gold_diff):.0f} atrás do time adversário) no momento da rendição"
+    elif towers_lost - towers_taken >= SURRENDER_TOWER_DIFF:
+        motivo = f"perda consistente de torres ({towers_lost} perdidas contra {towers_taken} tomadas)"
+    else:
+        motivo = "desvantagem acumulada ao longo da partida, sem um fator único dominante nos dados disponíveis"
+
+    detalhe = f"Partida encerrada por rendição do seu time, aos {minute:.0f}min. Motivo provável: {motivo}."
+    out.append(MacroEvent("rendicao", minute, detalhe, "atencao", confianca="media"))
+    return [e.to_dict() for e in out]
+
+
 # --- Heurísticas ---
 
 def h_cs_por_minuto(match, timeline, participant) -> list:
-    """1. CS acumulado nos checkpoints (5/10/15/20min) vs benchmark."""
+    """1. CS acumulado nos checkpoints (5/10/15/20min) vs benchmark — só nos checkpoints que a partida alcançou.
+    Não roda para JUNGLE: CS_PER_MIN_BENCHMARK é calibrado para farm de lane (creep score de laner) e não
+    reflete a curva de clear de floresta — aplicar o mesmo valor a um jungler gerava falso positivo
+    sistemático (jungler sempre aparecendo "abaixo do benchmark" de laner)."""
     out = []
     pid = participant["participantId"]
+    role = participant.get("teamPosition", "")
+    if role == "JUNGLE":
+        return out
+    duration_s = match["info"].get("gameDuration", 0)
     frames = get_frames(timeline)
-    for minute, expected in CS_PER_MIN_BENCHMARK.items():
+    for minute in reachable_checkpoints(sorted(CS_PER_MIN_BENCHMARK.keys()), duration_s):
+        expected = CS_PER_MIN_BENCHMARK[minute]
         frame = frame_at_minute(frames, minute)
         if frame is None:
             continue
@@ -130,6 +244,7 @@ def h_cs_por_minuto(match, timeline, participant) -> list:
                 "cs_abaixo_benchmark", minute,
                 f"CS aos {minute}min: {cs} (esperado ~{expected_cs:.0f}). Farm significativamente abaixo do benchmark.",
                 "atencao" if diff > -expected_cs * 0.4 else "critico",
+                confianca="media",
             ))
     return [e.to_dict() for e in out]
 
@@ -154,7 +269,7 @@ def h_gold_xp_diff_vs_oponente(match, timeline, participant, opponent) -> list:
     if peak_gold_diff >= 1000:
         out.append(MacroEvent(
             "vantagem_gold_lane", peak_minute,
-            f"Vantagem de gold de {peak_gold_diff:.0f} sobre o oponente de lane no pico.", "info",
+            f"Vantagem de gold de {peak_gold_diff:.0f} sobre o oponente de lane no pico.", "positivo",
         ))
     elif peak_gold_diff <= -1000:
         out.append(MacroEvent(
@@ -165,7 +280,8 @@ def h_gold_xp_diff_vs_oponente(match, timeline, participant, opponent) -> list:
 
 
 def h_presenca_em_objetivo(match, timeline, participant) -> list:
-    """5. Presença do jogador perto de dragão/arauto/barão no momento em que foi abatido."""
+    """5. Presença do jogador perto de dragão/arauto/barão no momento em que foi abatido.
+    Positivo quando presente e o próprio time tomou; atenção quando ausente."""
     out = []
     pid = participant["participantId"]
     team_id = participant["teamId"]
@@ -174,7 +290,7 @@ def h_presenca_em_objetivo(match, timeline, participant) -> list:
         if event.get("type") != "ELITE_MONSTER_KILL":
             continue
         minute = event["timestamp"] / 60000.0
-        monster = event.get("monsterType", "OBJETIVO")
+        monster = monster_name_pt(event.get("monsterType"))
         killer_team = event.get("killerTeamId")
         frame = frame_at_minute(frames, minute)
         pf = pframe(frame, pid) if frame else None
@@ -188,6 +304,14 @@ def h_presenca_em_objetivo(match, timeline, participant) -> list:
                 f"{monster} abatido {'pelo seu time' if was_teammate_kill else 'pelo time adversário'} "
                 f"enquanto você estava longe (~{dist:.0f} unidades) do local.",
                 "info" if was_teammate_kill else "atencao",
+                confianca="media",
+            ))
+        elif was_teammate_kill:
+            out.append(MacroEvent(
+                "presente_em_objetivo", minute,
+                f"Presente na tomada de {monster} pelo seu time.",
+                "positivo",
+                confianca="media",
             ))
     return [e.to_dict() for e in out]
 
@@ -230,6 +354,7 @@ def h_wards(match, timeline, participant) -> list:
                 "visao_abaixo_esperado", last_minute,
                 f"{placed} wards colocadas em {last_minute:.0f}min (~{rate:.2f}/min). Abaixo do esperado para {role or 'seu papel'}.",
                 "atencao",
+                confianca="media",
             ))
         out.append(MacroEvent("resumo_visao", last_minute, f"Total: {placed} wards colocadas, {killed} destruídas.", "info"))
     return [e.to_dict() for e in out]
@@ -262,6 +387,7 @@ def h_mortes_isoladas(match, timeline, participant) -> list:
                 "morte_isolada", minute,
                 f"Morte sem aliados por perto (mais próximo a ~{nearest_ally_dist:.0f} unidades).",
                 "atencao",
+                confianca="media",
             ))
     return [e.to_dict() for e in out]
 
@@ -285,7 +411,7 @@ def h_kill_participation(match, timeline, participant) -> list:
             player_participations += 1
     if team_kills > 0:
         pct = 100 * player_participations / team_kills
-        severidade = "atencao" if pct < 40 else "info"
+        severidade = "atencao" if pct < 40 else ("positivo" if pct >= 65 else "info")
         out.append(MacroEvent(
             "kill_participation", 0,
             f"Participação em {player_participations}/{team_kills} kills do time ({pct:.0f}%).",
@@ -326,7 +452,8 @@ def h_roams(match, timeline, participant) -> list:
             out.append(MacroEvent(
                 "roam" if resultado else "roam_sem_resultado", minute,
                 "Saiu da lane e resultou em kill/assist." if resultado else "Saiu da lane sem kill/assist em seguida (possível tempo perdido).",
-                "info" if resultado else "atencao",
+                "positivo" if resultado else "atencao",
+                confianca="media",
             ))
         prev_pos = pos
     return [e.to_dict() for e in out]
@@ -342,8 +469,8 @@ def h_objetivo_em_desvantagem(match, timeline, participant) -> list:
     for event in all_events(timeline):
         if event.get("type") != "ELITE_MONSTER_KILL":
             continue
-        monster = event.get("monsterType")
-        if monster not in ("BARON_NASHOR", "DRAGON") or event.get("monsterSubType") != "ELDER_DRAGON" and monster != "BARON_NASHOR":
+        monster_raw = event.get("monsterType")
+        if monster_raw not in ("BARON_NASHOR", "DRAGON") or event.get("monsterSubType") != "ELDER_DRAGON" and monster_raw != "BARON_NASHOR":
             continue
         if event.get("killerTeamId") != team_id:
             continue
@@ -357,18 +484,18 @@ def h_objetivo_em_desvantagem(match, timeline, participant) -> list:
         if diff < -2000:
             out.append(MacroEvent(
                 "objetivo_alto_risco", minute,
-                f"{monster} tomado com o time {abs(diff):.0f} de gold atrás do adversário — jogada de alto risco.",
+                f"{monster_name_pt(monster_raw)} tomado com o time {abs(diff):.0f} de gold atrás do adversário — jogada de alto risco.",
                 "atencao",
+                confianca="media",
             ))
     return [e.to_dict() for e in out]
 
 
 def h_freeze_push_wave_management(match, timeline, participant, opponent) -> list:
     """
-    3. Freeze/push mal executado — APROXIMAÇÃO. A Timeline API não expõe o
-    estado da wave (quantos minions, quem está empurrando), então isso é
-    inferido comparando a taxa de CS do jogador vs a do oponente de lane
-    entre checkpoints: se a taxa do jogador cai muito abaixo da do
+    3. Freeze/push mal executado — APROXIMAÇÃO. Compara a taxa de CS do
+    jogador vs a do oponente de lane entre checkpoints alcançáveis pela
+    duração real da partida: se a taxa do jogador cai muito abaixo da do
     oponente por uma janela inteira, é um sinal (não uma certeza) de
     freeze mal jogado ou wave perdida.
     """
@@ -376,8 +503,9 @@ def h_freeze_push_wave_management(match, timeline, participant, opponent) -> lis
     if opponent is None:
         return out
     pid, oid = participant["participantId"], opponent["participantId"]
+    duration_s = match["info"].get("gameDuration", 0)
     frames = get_frames(timeline)
-    checkpoints = sorted(CS_PER_MIN_BENCHMARK.keys())
+    checkpoints = reachable_checkpoints(sorted(CS_PER_MIN_BENCHMARK.keys()), duration_s)
     for a, b in zip(checkpoints, checkpoints[1:]):
         fa, fb = frame_at_minute(frames, a), frame_at_minute(frames, b)
         if fa is None or fb is None:
@@ -396,6 +524,7 @@ def h_freeze_push_wave_management(match, timeline, participant, opponent) -> lis
                 f"Entre {a}-{b}min, CS ganho foi de {player_rate} contra {opp_rate} do oponente de lane "
                 f"(diferença grande). Pode indicar freeze mal jogado ou wave perdida — sinal aproximado, vale conferir o replay.",
                 "atencao",
+                confianca="baixa",
             ))
     return [e.to_dict() for e in out]
 
@@ -406,8 +535,7 @@ def h_cs_perdido_em_recall(match, timeline, participant) -> list:
     na Timeline API, então uma visita à base é inferida por proximidade
     da posição do jogador à fonte do próprio time. Se, no frame seguinte
     a uma visita detectada, o CS não avançou nada, é sinal de possível
-    wave perdida por causa do recall (não conta lane empurrada pelo
-    inimigo, nem se o back era necessário).
+    wave perdida por causa do recall.
     """
     out = []
     pid = participant["participantId"]
@@ -433,6 +561,7 @@ def h_cs_perdido_em_recall(match, timeline, participant) -> list:
                         "possivel_cs_perdido_recall", minute,
                         "Visita à base detectada sem ganho de CS no minuto seguinte — possível wave perdida no recall (aproximado).",
                         "info",
+                        confianca="baixa",
                     ))
         was_at_base = at_base_now
     return [e.to_dict() for e in out]
@@ -443,8 +572,7 @@ def h_resposta_a_gank(match, timeline, participant) -> list:
     15. Resposta a gank do jungler inimigo — APROXIMAÇÃO. Detecta mortes
     do jogador causadas por um participante com papel JUNGLE do time
     adversário antes dos 20min, e verifica se havia ward do próprio
-    jogador colocada nos ~2min anteriores perto do local da morte — se
-    não havia, é sinal de visão insuficiente para reagir ao gank.
+    jogador colocada nos ~2min anteriores perto do local da morte.
     """
     out = []
     pid = participant["participantId"]
@@ -482,16 +610,18 @@ def h_resposta_a_gank(match, timeline, participant) -> list:
              if had_recent_vision else
              "Morto pelo jungler inimigo sem ward própria recente perto do local — visão insuficiente para reagir."),
             "info" if had_recent_vision else "atencao",
+            confianca="media",
         ))
     return [e.to_dict() for e in out]
 
 
 def h_gold_parado(match, timeline, participant) -> list:
-    """18. Gold parado (não gasto) em checkpoints de tempo — usa currentGold direto do frame, sem aproximação de recall."""
+    """18. Gold parado (não gasto) nos checkpoints alcançáveis pela duração real da partida."""
     out = []
     pid = participant["participantId"]
+    duration_s = match["info"].get("gameDuration", 0)
     frames = get_frames(timeline)
-    for minute in CS_PER_MIN_BENCHMARK.keys():
+    for minute in reachable_checkpoints(sorted(CS_PER_MIN_BENCHMARK.keys()), duration_s):
         frame = frame_at_minute(frames, minute)
         if frame is None:
             continue
@@ -508,12 +638,56 @@ def h_gold_parado(match, timeline, participant) -> list:
     return [e.to_dict() for e in out]
 
 
+def h_boas_trocas_de_dano(match, timeline, participant, opponent) -> list:
+    """
+    Ponto positivo: janelas da fase de laning em que o jogador causou bem
+    mais dano a campeões do que recebeu, sinal de troca de dano favorável.
+    Usa damageStats.totalDamageDoneToChampions / totalDamageTaken, que já
+    vêm nos participantFrames da Timeline API.
+    """
+    out = []
+    if opponent is None:
+        return out
+    pid = participant["participantId"]
+    duration_s = match["info"].get("gameDuration", 0)
+    frames = get_frames(timeline)
+    checkpoints = reachable_checkpoints([5, 10, 15], duration_s)
+    for a, b in zip(checkpoints, checkpoints[1:]):
+        fa, fb = frame_at_minute(frames, a), frame_at_minute(frames, b)
+        if fa is None or fb is None:
+            continue
+        pa, pb = pframe(fa, pid), pframe(fb, pid)
+        if pa is None or pb is None:
+            continue
+        dmg_done = pb.get("damageStats", {}).get("totalDamageDoneToChampions", 0) - \
+                   pa.get("damageStats", {}).get("totalDamageDoneToChampions", 0)
+        dmg_taken = pb.get("damageStats", {}).get("totalDamageTaken", 0) - \
+                    pa.get("damageStats", {}).get("totalDamageTaken", 0)
+        if dmg_done >= GOOD_TRADE_MIN_DAMAGE and dmg_done >= dmg_taken * GOOD_TRADE_RATIO:
+            out.append(MacroEvent(
+                "boa_troca_de_dano", b,
+                f"Entre {a}-{b}min, causou {dmg_done:.0f} de dano a campeões contra {dmg_taken:.0f} recebido — troca de dano favorável.",
+                "positivo",
+            ))
+    return [e.to_dict() for e in out]
+
+
 def run_all_heuristics(match: dict, timeline: dict, puuid: str) -> list:
-    """Roda todas as heurísticas disponíveis e retorna uma lista única de eventos, ordenada por minuto."""
+    """Roda todas as heurísticas disponíveis e retorna uma lista única de eventos, ordenada por minuto.
+    Partidas com remake retornam só o evento de remake — sem dado relevante pra analisar."""
     participant = get_analyzed_participant(match, puuid)
+
+    if bool(participant.get("gameEndedInEarlySurrender")):
+        return [MacroEvent(
+            "partida_remake", 0,
+            "Partida encerrada como remake (abandono/AFK nos primeiros minutos) — sem dados de macro relevantes para analisar.",
+            "info",
+        ).to_dict()]
+
     opponent = get_lane_opponent(match, participant)
 
     events = []
+    events += h_rendicao(match, timeline, participant, opponent)
     events += h_cs_por_minuto(match, timeline, participant)
     events += h_gold_xp_diff_vs_oponente(match, timeline, participant, opponent)
     events += h_presenca_em_objetivo(match, timeline, participant)
@@ -527,6 +701,7 @@ def run_all_heuristics(match: dict, timeline: dict, puuid: str) -> list:
     events += h_cs_perdido_em_recall(match, timeline, participant)
     events += h_resposta_a_gank(match, timeline, participant)
     events += h_gold_parado(match, timeline, participant)
+    events += h_boas_trocas_de_dano(match, timeline, participant, opponent)
 
     events.sort(key=lambda e: e["minuto"])
     return events
