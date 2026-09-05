@@ -38,4 +38,4 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "data", "lol_macro.sqlite3")
 
 # --- LLM local (usado na etapa de geração de comentário, não nesta parte) ---
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")

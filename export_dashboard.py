@@ -22,7 +22,7 @@ from datetime import datetime
 import requests
 
 import storage
-from heuristics import run_all_heuristics
+from heuristics import run_all_heuristics, is_remake
 from commentary import gerar_comentario
 from ollama_client import OllamaError
 
@@ -72,14 +72,15 @@ def montar_dados(puuid: str, ddragon_version: str, gerar_comentarios: bool = Fal
             print(f"[Aviso] Falha ao rodar heurísticas em {m['match_id']}: {e}", file=sys.stderr)
             events = []
 
-        counts = {"critico": 0, "atencao": 0, "info": 0}
+        counts = {"positivo": 0, "critico": 0, "atencao": 0, "info": 0}
         for e in events:
             counts[e.get("severidade", "info")] = counts.get(e.get("severidade", "info"), 0) + 1
 
         champion = m["champion_name"] or "Desconhecido"
+        remake = is_remake(match_data, puuid)
 
         coach_commentary = storage.get_commentary(m["match_id"])
-        if coach_commentary is None and gerar_comentarios:
+        if coach_commentary is None and gerar_comentarios and not remake:
             print(f"  Gerando comentário do coach para {champion} ({m['match_id']})...")
             try:
                 coach_commentary = gerar_comentario(
@@ -96,6 +97,7 @@ def montar_dados(puuid: str, ddragon_version: str, gerar_comentarios: bool = Fal
             "champion_name": champion,
             "champion_icon_url": DDRAGON_ICON_TEMPLATE.format(version=ddragon_version, champion=champion),
             "win": m["win"],
+            "remake": remake,
             "game_creation_ms": m["game_creation"],
             "game_duration_s": m["game_duration"],
             "events": events,
@@ -148,6 +150,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .pill{font-size:11px;font-weight:600;padding:2px 7px;border-radius:4px;flex-shrink:0;}
   .pill.win{background:rgba(73,191,138,.15);color:var(--win);}
   .pill.loss{background:rgba(229,82,95,.15);color:var(--loss);}
+  .pill.remake{background:rgba(139,147,168,.15);color:var(--text-dim);}
   .empty-list{padding:20px;color:var(--text-dim);font-size:13px;}
 
   .main{overflow-y:auto;padding:26px 30px;}
@@ -241,8 +244,8 @@ const FALLBACK_ICON = 'data:image/svg+xml,' + encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect width="64" height="64" rx="10" fill="#232c42"/><text x="32" y="40" font-size="26" text-anchor="middle" fill="#8b93a8" font-family="sans-serif">?</text></svg>'
 );
 
-const SEV_COLOR = { critico: '#e5525f', atencao: '#c8a24c', info: '#18c3b2' };
-const SEV_LABEL = { critico: 'Crítico', atencao: 'Atenção', info: 'Info' };
+const SEV_COLOR = { positivo: '#49bf8a', critico: '#e5525f', atencao: '#c8a24c', info: '#18c3b2' };
+const SEV_LABEL = { positivo: 'Positivo', critico: 'Crítico', atencao: 'Atenção', info: 'Info' };
 
 let currentMatchId = null;
 
@@ -285,15 +288,16 @@ function renderSidebar(filterText){
         '<div class="champ-name">' + m.champion_name + '</div>' +
         '<div class="meta">' + formatDate(m.game_creation_ms) + '</div>' +
       '</div>' +
-      '<span class="pill ' + (m.win ? 'win' : 'loss') + '">' + (m.win ? 'V' : 'D') + '</span>';
+      '<span class="pill ' + (m.remake ? 'remake' : (m.win ? 'win' : 'loss')) + '">' + (m.remake ? 'R' : (m.win ? 'V' : 'D')) + '</span>';
     list.appendChild(row);
   });
 }
 
 function renderKPIs(){
   const total = DATA.matches.length;
-  const wins = DATA.matches.filter(function(m){ return m.win; }).length;
-  const winRate = total ? Math.round((wins/total)*100) : 0;
+  const nonRemake = DATA.matches.filter(function(m){ return !m.remake; });
+  const wins = nonRemake.filter(function(m){ return m.win; }).length;
+  const winRate = nonRemake.length ? Math.round((wins/nonRemake.length)*100) : 0;
   const totalCritical = DATA.matches.reduce(function(acc,m){ return acc + (m.counts.critico || 0); }, 0);
   const champCounts = {};
   DATA.matches.forEach(function(m){ champCounts[m.champion_name] = (champCounts[m.champion_name] || 0) + 1; });
@@ -304,7 +308,7 @@ function renderKPIs(){
 
   const kpis = [
     { value: total, label: 'Partidas analisadas' },
-    { value: winRate + '%', label: 'Win rate' },
+    { value: winRate + '%', label: 'Win rate (exclui remakes)' },
     { value: totalCritical, label: 'Alertas críticos (total)' },
     { value: topChamp || '—', label: 'Campeão mais jogado' },
   ];
@@ -323,6 +327,20 @@ function selectMatch(matchId){
 
 function renderDetail(m){
   const el = document.getElementById('matchDetail');
+
+  if(m.remake){
+    el.innerHTML =
+      '<div class="detail-header">' +
+        '<img src="' + m.champion_icon_url + '" onerror="this.onerror=null;this.src=FALLBACK_ICON;" alt="' + m.champion_name + '">' +
+        '<div>' +
+          '<h2>' + m.champion_name + '<span class="pill remake">Remake</span></h2>' +
+          '<div class="sub">' + formatDate(m.game_creation_ms) + '</div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="empty-state">Partida encerrada como remake (abandono/AFK nos primeiros minutos). Sem dados de macro relevantes para analisar.</div>';
+    return;
+  }
+
   const durationMin = Math.round((m.game_duration_s || 0) / 60);
   const total = m.events.length;
 
@@ -333,7 +351,7 @@ function renderDetail(m){
     return '<div class="dot" style="left:' + pct + '%;background:' + color + ';" title="' + title.replace(/"/g,'&quot;') + '"></div>';
   }).join('');
 
-  const sevOrder = ['critico','atencao','info'];
+  const sevOrder = ['positivo','critico','atencao','info'];
   const sevTotal = total || 1;
   const stackedBar = sevOrder.map(function(s){
     const count = m.counts[s] || 0;
@@ -371,6 +389,8 @@ function renderDetail(m){
     return '<div class="event-groups"><h3>' + phaseTitles[k] + '</h3>' + rows + '</div>';
   }).join('');
 
+  const rendeuEvento = m.events.find(function(e){ return e.tipo === 'rendicao'; });
+
   el.innerHTML =
     '<div class="detail-header">' +
       '<img src="' + m.champion_icon_url + '" onerror="this.onerror=null;this.src=FALLBACK_ICON;" alt="' + m.champion_name + '">' +
@@ -380,6 +400,7 @@ function renderDetail(m){
         '<div class="chip-row">' +
           '<span class="chip">' + formatDuration(m.game_duration_s) + ' de partida</span>' +
           '<span class="chip">' + total + ' eventos detectados</span>' +
+          (rendeuEvento ? '<span class="chip">Encerrada por rendição</span>' : '') +
         '</div>' +
       '</div>' +
     '</div>' +

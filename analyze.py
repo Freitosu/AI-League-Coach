@@ -28,7 +28,7 @@ def analisar(match_id: str, puuid: str, output_path: str = None, comentario: boo
 
     print(f"\n=== Relatório de macro — partida {match_id} ({len(events)} eventos) ===\n")
     for e in events:
-        marcador = {"info": "  ", "atencao": "⚠ ", "critico": "‼ "}.get(e["severidade"], "  ")
+        marcador = {"positivo": "✓ ", "info": "  ", "atencao": "⚠ ", "critico": "‼ "}.get(e["severidade"], "  ")
         print(f"{marcador}[{e['minuto']:>5.1f}min] {e['tipo']:<28} {e['detalhe']}")
 
     if output_path:

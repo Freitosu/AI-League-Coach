@@ -71,16 +71,37 @@ test_heuristics.py # teste sintético das heurísticas
 `heuristics.py` lê o (match, timeline) salvos e gera eventos estruturados:
 CS/min vs benchmark, gold/xp diff vs oponente de lane, presença em
 objetivo, torres por fase, wards colocadas/destruídas, mortes isoladas,
-kill participation, roams e objetivos tomados em desvantagem.
+kill participation, roams e objetivos tomados em desvantagem — além de:
+
+- **Detecção de remake**: partidas encerradas por abandono/AFK nos
+  primeiros minutos (`gameEndedInEarlySurrender`) retornam só um evento
+  de remake, sem heurísticas sem sentido rodando em cima de dado curto
+  demais.
+- **Detecção de rendição**: partidas encerradas por FF (`gameEndedInSurrender`)
+  geram um evento com um **motivo provável** (desvantagem de gold ou
+  saldo de torres no momento da rendição) quando o time perde, ou um
+  evento positivo quando o adversário desiste com você na frente. É uma
+  inferência qualitativa — a Riot não expõe o motivo real da votação.
+- **Checkpoints respeitam a duração real da partida**: os benchmarks de
+  5/10/15/20min só são avaliados se a partida durou o suficiente para
+  chegar lá — corrige o bug em que uma partida curta comparava CS de um
+  minuto que nunca aconteceu (ex: mostrar "CS abaixo aos 5min" usando o
+  frame de 1min disponível).
+- **Eventos positivos** (severidade `"positivo"`): vantagem de gold vs
+  oponente de lane, presença em objetivo que o time tomou, roam
+  bem-sucedido, boa troca de dano (mais dano causado a campeões do que
+  recebido numa janela de laning), alta participação em kills, e a
+  rendição do inimigo enquanto você vencia.
 
 Rodar sobre uma partida já baixada:
 ```bash
 python analyze.py <match_id> <puuid> --output relatorio.json
 ```
 
-Rodar o teste sintético (não depende da API):
+Rodar os testes sintéticos (não dependem da API):
 ```bash
 python test_heuristics.py
+python test_new_heuristics.py   # remake, rendição, timing, eventos positivos
 ```
 
 Todas as 13 heurísticas da lista original estão implementadas,

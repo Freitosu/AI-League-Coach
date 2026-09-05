@@ -21,3 +21,7 @@ Thumbs.db
 
 # Logs (se algum script vier a gerar)
 *.log
+
+# Artefatos locais do Ollama e temporários do editor
+ollama-models/
+*.tmp

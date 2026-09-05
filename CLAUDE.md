@@ -31,6 +31,7 @@ Pipeline local, sem custo de API de IA:
 | `commentary.py` | Monta o prompt e gera o comentário de coach via Ollama |
 | `export_dashboard.py` | Monta os dados + gera o HTML do dashboard (template embutido) |
 | `test_heuristics.py` | Teste sintético das heurísticas, sem depender da API real |
+| `test_new_heuristics.py` | Teste sintético de remake, rendição, timing e eventos positivos |
 
 ## Nunca ler estes arquivos por inteiro
 
