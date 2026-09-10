@@ -40,7 +40,11 @@ DRAGON_RESPAWN_S = 5 * 60
 HERALD_SPAWN_S = 8 * 60
 BARON_SPAWN_S = 20 * 60
 
-ROAM_MIN_DISTANCE = 1800       # unidades de mapa; jump considerado "saiu da lane"
+ROAM_MIN_DISTANCE = 1800       # unidades de mapa; distância da "home position" considerada "fora da lane"
+ROAM_HOME_WINDOW = (2.0, 8.0)  # minutos usados para calcular a posição mediana de laning ("home")
+ROAM_MIN_DURATION_S = 60       # janelas mais curtas que isso são ruído (ward run, reposicionamento), não roam
+ROAM_EVIDENCE_BUFFER_S = 30    # margem após o fim da janela para procurar evidência de resultado
+ROAM_OBJECTIVE_DIST = 4000     # distância máxima até um objetivo do próprio time para contar como evidência
 TEAMFIGHT_WINDOW_S = 12        # kills dentro dessa janela contam como o mesmo teamfight
 ISOLATED_DEATH_MAX_ALLY_DIST = 3000  # distância do aliado mais próximo para considerar morte "isolada"
 
@@ -420,42 +424,126 @@ def h_kill_participation(match, timeline, participant) -> list:
     return [e.to_dict() for e in out]
 
 
+def _home_position(frames: list, pid: int) -> Optional[dict]:
+    """Posição 'de casa' do jogador na fase de laning (mediana entre ROAM_HOME_WINDOW),
+    usada como referência dinâmica em vez de coordenadas fixas de lane por patch/lado do mapa."""
+    start, end = ROAM_HOME_WINDOW
+    xs, ys = [], []
+    for frame in frames:
+        minute = frame_minute(frame)
+        if minute < start or minute > end:
+            continue
+        pf = pframe(frame, pid)
+        if pf is None or "position" not in pf:
+            continue
+        xs.append(pf["position"]["x"])
+        ys.append(pf["position"]["y"])
+    if not xs:
+        return None
+    xs.sort()
+    ys.sort()
+    mid = len(xs) // 2
+    return {"x": xs[mid], "y": ys[mid]}
+
+
 def h_roams(match, timeline, participant) -> list:
     """
-    13. Roams: saltos de posição para longe da região de lane, avaliados
-    pelo resultado (kill/assist do jogador em até 45s depois).
-    Heurística por posição — aproximada, sem acesso a "wave state" real.
+    13. Roams: candidatos identificados por permanência contínua fora da
+    'home position' de laning (mediana de posição entre 2-8min), agrupados
+    em uma única janela por saída (em vez de um evento por frame que apenas
+    saltou de posição).
+
+    Isso é uma APROXIMAÇÃO por posição — não captura intenção diretamente
+    (ver distinção entre roam de verdade e falso positivo por recall,
+    perseguição, fuga ou reposicionamento). Para reduzir falsos positivos,
+    a janela:
+      - exclui trechos que tocam a própria base (recall, não roam);
+      - descarta janelas curtas (< ROAM_MIN_DURATION_S), tratadas como ruído;
+      - busca evidência de intenção/resultado no período (kill/assist do
+        jogador, ou presença perto de objetivo abatido pelo próprio time
+        logo em seguida) para atribuir confiança alta/media/baixa, em vez
+        de tratar 'saiu da lane' como fato consumado.
     """
     out = []
     pid = participant["participantId"]
+    team_id = participant["teamId"]
     role = participant.get("teamPosition", "")
     if role in ("JUNGLE", ""):
         return out  # roaming é comportamento esperado do jungler; heurística não se aplica bem
-    frames = get_frames(timeline)
-    kill_events = [e for e in all_events(timeline) if e.get("type") == "CHAMPION_KILL"]
 
-    prev_pos = None
+    frames = get_frames(timeline)
+    home = _home_position(frames, pid)
+    if home is None:
+        return out
+    base = BASE_COORDS.get(team_id)
+
+    kill_events = [e for e in all_events(timeline) if e.get("type") == "CHAMPION_KILL"]
+    objective_events = [e for e in all_events(timeline) if e.get("type") in ("ELITE_MONSTER_KILL", "BUILDING_KILL")]
+
+    # 1. Marca frames "fora de casa" e agrupa em janelas contíguas.
+    janelas = []
+    janela_atual = None
     for frame in frames:
         pf = pframe(frame, pid)
         if pf is None or "position" not in pf:
             continue
         pos = pf["position"]
         minute = frame_minute(frame)
-        if prev_pos is not None and distance(pos, prev_pos) > ROAM_MIN_DISTANCE and minute < 25:
-            window_start = frame["timestamp"]
-            window_end = window_start + 45000
-            resultado = any(
-                window_start <= e["timestamp"] <= window_end
-                and (e.get("killerId") == pid or pid in e.get("assistingParticipantIds", []))
-                for e in kill_events
-            )
-            out.append(MacroEvent(
-                "roam" if resultado else "roam_sem_resultado", minute,
-                "Saiu da lane e resultou em kill/assist." if resultado else "Saiu da lane sem kill/assist em seguida (possível tempo perdido).",
-                "positivo" if resultado else "atencao",
-                confianca="media",
-            ))
-        prev_pos = pos
+        if minute >= 25:
+            continue
+        fora_de_casa = distance(pos, home) > ROAM_MIN_DISTANCE
+        tocando_base = base is not None and distance(pos, base) < NEAR_BASE_RADIUS
+        if fora_de_casa and not tocando_base:
+            if janela_atual is None:
+                janela_atual = {"inicio_ts": frame["timestamp"], "fim_ts": frame["timestamp"]}
+            else:
+                janela_atual["fim_ts"] = frame["timestamp"]
+        else:
+            if janela_atual is not None:
+                janelas.append(janela_atual)
+                janela_atual = None
+    if janela_atual is not None:
+        janelas.append(janela_atual)
+
+    # 2. Filtra por duração mínima e busca evidência dentro de cada janela (+ buffer).
+    for j in janelas:
+        duracao_s = (j["fim_ts"] - j["inicio_ts"]) / 1000.0
+        if duracao_s < ROAM_MIN_DURATION_S:
+            continue
+        minuto_inicio = j["inicio_ts"] / 60000.0
+        minuto_fim = j["fim_ts"] / 60000.0
+        busca_fim = j["fim_ts"] + ROAM_EVIDENCE_BUFFER_S * 1000
+
+        teve_kill_assist = any(
+            j["inicio_ts"] <= e["timestamp"] <= busca_fim
+            and (e.get("killerId") == pid or pid in e.get("assistingParticipantIds", []))
+            for e in kill_events
+        )
+        perto_de_objetivo_proprio = False
+        if not teve_kill_assist:
+            frame_fim = frame_at_minute(frames, minuto_fim)
+            pf_fim = pframe(frame_fim, pid) if frame_fim else None
+            if pf_fim and "position" in pf_fim:
+                perto_de_objetivo_proprio = any(
+                    j["inicio_ts"] <= e["timestamp"] <= busca_fim
+                    and e.get("killerTeamId") == team_id
+                    and distance(pf_fim["position"], e.get("position", pf_fim["position"])) < ROAM_OBJECTIVE_DIST
+                    for e in objective_events
+                )
+
+        if teve_kill_assist:
+            tipo, severidade, confianca = "roam", "positivo", "alta"
+            detalhe = f"Saiu da lane ({minuto_inicio:.1f}-{minuto_fim:.1f}min, ~{duracao_s:.0f}s) e resultou em kill/assist."
+        elif perto_de_objetivo_proprio:
+            tipo, severidade, confianca = "roam", "positivo", "media"
+            detalhe = (f"Saiu da lane ({minuto_inicio:.1f}-{minuto_fim:.1f}min, ~{duracao_s:.0f}s) "
+                       "e esteve perto de um objetivo abatido pelo time logo em seguida — possível suporte a jogada.")
+        else:
+            tipo, severidade, confianca = "roam_sem_resultado", "atencao", "baixa"
+            detalhe = (f"Saiu da lane ({minuto_inicio:.1f}-{minuto_fim:.1f}min, ~{duracao_s:.0f}s) sem evidência "
+                       "de kill/assist ou objetivo em seguida — candidato a roam sem resultado (aproximado, vale conferir o replay).")
+
+        out.append(MacroEvent(tipo, minuto_inicio, detalhe, severidade, confianca=confianca))
     return [e.to_dict() for e in out]
 
 
