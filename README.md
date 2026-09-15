@@ -69,10 +69,25 @@ test_heuristics.py # teste sintético das heurísticas
 ## Parte 2 — Heurísticas (implementada)
 
 `heuristics.py` lê o (match, timeline) salvos e gera eventos estruturados:
-CS/min vs benchmark, gold/xp diff vs oponente de lane, presença em
-objetivo, torres por fase, wards colocadas/destruídas, mortes isoladas,
+CS/min vs benchmark, gold/xp diff vs oponente de lane, curva de lane por
+checkpoint (ouro/CS/XP/plates vs o oponente direto em 5/10/15/20min),
+presença em objetivo, torres e inibidores por fase, wards
+colocadas/destruídas, mortes isoladas (com contexto de risco: inimigos
+próximos, visão recente, se estava fora da posição habitual de lane),
 kill participation, roams e objetivos tomados em desvantagem — além de:
 
+- **Schema de confiança** (`confianca`: `alta`/`media`/`baixa`, separado
+  de `severidade`): todo evento distingue fato observado direto na
+  timeline (`alta`) de inferência aproximada por posição/janela de tempo
+  (`media`/`baixa`) — o `commentary.py` usa isso para instruir o LLM a
+  tratar cada nível de forma diferente (fato vs "possivelmente").
+- **Roams por janela contígua**: em vez de um evento por frame que
+  saltou de posição, `h_roams` calcula uma "home position" dinâmica do
+  jogador (mediana de posição entre 2-8min) e agrupa toda a permanência
+  contínua fora dela em uma única janela — exclui trechos que tocam a
+  própria base (recall ≠ roam), descarta janelas curtas (<60s, ruído), e
+  classifica confiança por evidência de kill/assist ou objetivo próximo
+  em seguida, em vez de tratar toda saída de lane como fato.
 - **Detecção de remake**: partidas encerradas por abandono/AFK nos
   primeiros minutos (`gameEndedInEarlySurrender`) retornam só um evento
   de remake, sem heurísticas sem sentido rodando em cima de dado curto
@@ -87,6 +102,9 @@ kill participation, roams e objetivos tomados em desvantagem — além de:
   chegar lá — corrige o bug em que uma partida curta comparava CS de um
   minuto que nunca aconteceu (ex: mostrar "CS abaixo aos 5min" usando o
   frame de 1min disponível).
+- **Torres vs inibidores**: `h_torres_por_fase` checa `buildingType`
+  antes de `towerType` — inibidores não têm `towerType`, então sem essa
+  checagem apareciam rotulados como "Torre (LANE, ?)" em vez de Inibidor.
 - **Eventos positivos** (severidade `"positivo"`): vantagem de gold vs
   oponente de lane, presença em objetivo que o time tomou, roam
   bem-sucedido, boa troca de dano (mais dano causado a campeões do que
@@ -100,8 +118,7 @@ python analyze.py <match_id> <puuid> --output relatorio.json
 
 Rodar os testes sintéticos (não dependem da API):
 ```bash
-python test_heuristics.py
-python test_new_heuristics.py   # remake, rendição, timing, eventos positivos
+python test_heuristics.py   # cobre básicos + remake, rendição, timing, eventos positivos
 ```
 
 Todas as 13 heurísticas da lista original estão implementadas,
@@ -189,13 +206,14 @@ pela última vez e o comando pra atualizar.
 
 ## Próximos passos
 
-- **Sincronização com vídeo**: input manual (ou detecção simples) do
-  timestamp de início da partida no vídeo para converter
-  minuto_de_jogo → timestamp_do_vídeo, e permitir pular direto para o
-  momento do erro/acerto ao assistir a gravação.
+- **Sincronização com replay**: integração com o LoL Replay API local
+  (`https://127.0.0.1:2999/replay/`, requer `EnableReplayApi=1` em
+  `game.cfg`) para gerar um roteiro de coaching com timestamps e
+  auto-pause nos momentos de macro relevantes — narração em tempo real
+  foi descartada, o plano é um roteiro assíncrono.
 - **Ajuste fino de benchmarks**: os valores de CS/min e de spawn de
   objetivo em `heuristics.py` são aproximados; ajustar por elo/patch
   deixaria os alertas mais precisos.
-- **Experimentar modelos maiores no Ollama** (ex: `qwen2.5:14b`) se a
-  qualidade do comentário do `llama3.1:8b` não for suficiente — troque
-  só `OLLAMA_MODEL` em `config.py` ou no `.env`.
+- **Modelo ativo**: `qwen2.5:14b` (configurado via `OLLAMA_MODEL` no
+  `.env`) substituiu o `llama3.1:8b` do exemplo acima por qualidade de
+  comentário melhor.

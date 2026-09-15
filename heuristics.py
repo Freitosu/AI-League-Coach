@@ -47,6 +47,12 @@ ROAM_EVIDENCE_BUFFER_S = 30    # margem após o fim da janela para procurar evid
 ROAM_OBJECTIVE_DIST = 4000     # distância máxima até um objetivo do próprio time para contar como evidência
 TEAMFIGHT_WINDOW_S = 12        # kills dentro dessa janela contam como o mesmo teamfight
 ISOLATED_DEATH_MAX_ALLY_DIST = 3000  # distância do aliado mais próximo para considerar morte "isolada"
+ENEMY_NEARBY_RADIUS = 2000     # distância para contar um adversário como "próximo" no momento da morte
+DEATH_VISION_WINDOW_S = 120    # janela antes da morte em que uma ward própria conta como "visão recente"
+DEATH_VISION_RADIUS = 2500     # distância da ward até o local da morte para contar como visão do local
+
+# Mapeia o papel do participante para o laneType usado nos eventos de torre/plate da Riot.
+ROLE_TO_LANE = {"TOP": "TOP_LANE", "MIDDLE": "MID_LANE", "BOTTOM": "BOT_LANE", "UTILITY": "BOT_LANE"}
 
 # Posição aproximada da fonte de cada time no Summoner's Rift (usada como proxy de "está na base").
 BASE_COORDS = {100: {"x": 1500, "y": 1500}, 200: {"x": 13500, "y": 13500}}
@@ -283,6 +289,63 @@ def h_gold_xp_diff_vs_oponente(match, timeline, participant, opponent) -> list:
     return [e.to_dict() for e in out]
 
 
+def h_lane_snapshot(match, timeline, participant, opponent) -> list:
+    """Curva de lane por checkpoint (5/10/15/20min, conforme alcançáveis pela duração real):
+    diferença de gold, CS e XP vs o oponente direto, mais o saldo de turret plates na lane.
+    Complementa h_gold_xp_diff_vs_oponente (que só guarda o PICO) com uma progressão completa —
+    permite ao coach dizer 'estava ganhando a lane aos 10min, mas...' em vez de só o resultado
+    final. Tudo aqui é dado direto da timeline (gold/CS/XP/plates), sem aproximação de posição."""
+    out = []
+    if opponent is None:
+        return out
+    role = participant.get("teamPosition", "")
+    lane = ROLE_TO_LANE.get(role)
+    pid, oid = participant["participantId"], opponent["participantId"]
+    team_id = participant["teamId"]
+    duration_s = match["info"].get("gameDuration", 0)
+    frames = get_frames(timeline)
+    plate_events = [e for e in all_events(timeline) if e.get("type") == "TURRET_PLATE_DESTROYED"]
+
+    for minute in reachable_checkpoints(sorted(CS_PER_MIN_BENCHMARK.keys()), duration_s):
+        frame = frame_at_minute(frames, minute)
+        if frame is None:
+            continue
+        pf, of = pframe(frame, pid), pframe(frame, oid)
+        if pf is None or of is None:
+            continue
+
+        gold_diff = pf.get("totalGold", 0) - of.get("totalGold", 0)
+        cs_diff = (pf.get("minionsKilled", 0) + pf.get("jungleMinionsKilled", 0)) - \
+                  (of.get("minionsKilled", 0) + of.get("jungleMinionsKilled", 0))
+        xp_diff = pf.get("xp", 0) - of.get("xp", 0)
+
+        plates_tomadas = plates_perdidas = 0
+        if lane is not None:
+            for e in plate_events:
+                if e["timestamp"] > frame["timestamp"] or e.get("laneType") != lane:
+                    continue
+                if e.get("teamId") == team_id:
+                    plates_perdidas += 1
+                else:
+                    plates_tomadas += 1
+
+        if gold_diff >= 300:
+            severidade = "positivo"
+        elif gold_diff <= -300:
+            severidade = "atencao"
+        else:
+            severidade = "info"
+
+        plates_txt = f" Plates na lane: {plates_tomadas} tomada(s), {plates_perdidas} perdida(s)." if lane else ""
+        detalhe = (
+            f"Aos {minute}min vs oponente de lane: ouro {gold_diff:+.0f} "
+            f"(você {pf.get('totalGold', 0):.0f} vs {of.get('totalGold', 0):.0f}), "
+            f"CS {cs_diff:+d}, XP {xp_diff:+.0f}.{plates_txt}"
+        )
+        out.append(MacroEvent("lane_snapshot", minute, detalhe, severidade, confianca="alta"))
+    return [e.to_dict() for e in out]
+
+
 def h_presenca_em_objetivo(match, timeline, participant) -> list:
     """5. Presença do jogador perto de dragão/arauto/barão no momento em que foi abatido.
     Positivo quando presente e o próprio time tomou; atenção quando ausente."""
@@ -321,18 +384,28 @@ def h_presenca_em_objetivo(match, timeline, participant) -> list:
 
 
 def h_torres_por_fase(match, timeline) -> list:
-    """8. Torres tomadas/perdidas, agrupadas por fase do jogo."""
+    """8. Torres e inibidores destruídos, agrupados por fase do jogo. Checa buildingType
+    antes de towerType: inibidores não têm towerType, então sem essa checagem apareciam
+    rotulados como 'Torre (LANE, ?)' em vez de Inibidor."""
     out = []
     for event in all_events(timeline):
         if event.get("type") != "BUILDING_KILL":
             continue
         minute = event["timestamp"] / 60000.0
         fase = "early" if minute < 15 else "mid" if minute < 25 else "late"
-        out.append(MacroEvent(
-            "torre_destruida", minute,
-            f"Torre ({event.get('laneType', '?')}, {event.get('towerType', '?')}) destruída na fase {fase}.",
-            "info",
-        ))
+        lane = event.get("laneType", "?")
+        if event.get("buildingType") == "INHIBITOR_BUILDING":
+            out.append(MacroEvent(
+                "inibidor_destruido", minute,
+                f"Inibidor ({lane}) destruído na fase {fase}.",
+                "info",
+            ))
+        else:
+            out.append(MacroEvent(
+                "torre_destruida", minute,
+                f"Torre ({lane}, {event.get('towerType', '?')}) destruída na fase {fase}.",
+                "info",
+            ))
     return [e.to_dict() for e in out]
 
 
@@ -365,12 +438,20 @@ def h_wards(match, timeline, participant) -> list:
 
 
 def h_mortes_isoladas(match, timeline, participant) -> list:
-    """19. Mortes do jogador sem aliados próximos (fora de grupo)."""
+    """19. Mortes do jogador sem aliados próximos (fora de grupo). Enriquecido com contexto
+    de risco no momento da morte — quantos adversários estavam por perto, se havia visão
+    própria recente do local, e se o jogador estava fora da posição habitual de lane — para
+    o coach poder distinguir 'avançou sem informação' de outros padrões, em vez de só contar
+    mortes."""
     out = []
     pid = participant["participantId"]
     team_id = participant["teamId"]
     ally_ids = [p["participantId"] for p in match["info"]["participants"] if p["teamId"] == team_id and p["participantId"] != pid]
+    enemy_ids = [p["participantId"] for p in match["info"]["participants"] if p["teamId"] != team_id]
     frames = get_frames(timeline)
+    home = _home_position(frames, pid)
+    own_wards = [e for e in all_events(timeline) if e.get("type") == "WARD_PLACED" and e.get("creatorId") == pid]
+
     for event in all_events(timeline):
         if event.get("type") != "CHAMPION_KILL" or event.get("victimId") != pid:
             continue
@@ -386,13 +467,28 @@ def h_mortes_isoladas(match, timeline, participant) -> list:
              for aid in ally_ids if pframe(frame, aid) and "position" in pframe(frame, aid)),
             default=None,
         )
-        if nearest_ally_dist is not None and nearest_ally_dist > ISOLATED_DEATH_MAX_ALLY_DIST:
-            out.append(MacroEvent(
-                "morte_isolada", minute,
-                f"Morte sem aliados por perto (mais próximo a ~{nearest_ally_dist:.0f} unidades).",
-                "atencao",
-                confianca="media",
-            ))
+        if nearest_ally_dist is None or nearest_ally_dist <= ISOLATED_DEATH_MAX_ALLY_DIST:
+            continue
+
+        inimigos_proximos = sum(
+            1 for eid in enemy_ids
+            if pframe(frame, eid) and "position" in pframe(frame, eid)
+            and distance(death_pos, pframe(frame, eid)["position"]) <= ENEMY_NEARBY_RADIUS
+        )
+        tinha_visao = any(
+            (event["timestamp"] - DEATH_VISION_WINDOW_S * 1000) <= w["timestamp"] <= event["timestamp"]
+            and "position" in w and distance(w["position"], death_pos) < DEATH_VISION_RADIUS
+            for w in own_wards
+        )
+        fora_de_casa = home is not None and distance(death_pos, home) > ROAM_MIN_DISTANCE
+
+        detalhe = (
+            f"Morte isolada (aliado mais próximo a ~{nearest_ally_dist:.0f}u), "
+            f"{inimigos_proximos} adversário(s) próximo(s) no momento (~{ENEMY_NEARBY_RADIUS}u), "
+            f"{'com' if tinha_visao else 'sem'} visão própria recente no local"
+            f"{', fora da posição habitual de lane' if fora_de_casa else ''}."
+        )
+        out.append(MacroEvent("morte_isolada", minute, detalhe, "atencao", confianca="media"))
     return [e.to_dict() for e in out]
 
 
@@ -778,6 +874,7 @@ def run_all_heuristics(match: dict, timeline: dict, puuid: str) -> list:
     events += h_rendicao(match, timeline, participant, opponent)
     events += h_cs_por_minuto(match, timeline, participant)
     events += h_gold_xp_diff_vs_oponente(match, timeline, participant, opponent)
+    events += h_lane_snapshot(match, timeline, participant, opponent)
     events += h_presenca_em_objetivo(match, timeline, participant)
     events += h_torres_por_fase(match, timeline)
     events += h_wards(match, timeline, participant)
